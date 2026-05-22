@@ -1,0 +1,5 @@
+idf_component_register(
+    SRCS "main.c"
+         "config_store.c"
+    INCLUDE_DIRS "."
+)
