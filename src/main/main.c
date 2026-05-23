@@ -43,10 +43,12 @@
 #include "esp_adc/adc_oneshot.h"
 
 /* BLE */
-#include "esp_bt.h"
-#include "esp_gap_ble_api.h"    // BLEアドバタイズ (GAP)
-#include "esp_gatts_api.h"      // BLE GATT Server
-#include "esp_bt_main.h"
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "services/gap/ble_svc_gap.h"
+
 
 /* 共通ライブラリ */
 #include "ble_protocol.h"
@@ -58,9 +60,9 @@
 static const char *TAG = "slave";
 
 // --- GPIO ピン定義 (実際の配線に合わせて変更) ---
-#define GPIO_PUMP           GPIO_NUM_25     // 水やりポンプ制御
-#define GPIO_MODE_SWITCH    GPIO_NUM_26     // メンテナンスモードスイッチ
-#define GPIO_LED_STATUS     GPIO_NUM_2      // ステータスLED
+#define GPIO_PUMP           GPIO_NUM_6      // D4
+#define GPIO_MODE_SWITCH    GPIO_NUM_7      // D5
+#define GPIO_LED_STATUS     GPIO_NUM_15     // オンボードLED
 
 // --- I2C設定 (センサー用) ---
 #define I2C_MASTER_SDA      GPIO_NUM_21
@@ -175,125 +177,72 @@ static void check_and_water(sensor_data_t *data)
  *     - CHAR_SENSOR_DATA: 親機がReadする → センサーデータを返す
  *     - CHAR_CONTROL_PARAMS: 親機がWriteする → 制御パラメータを受け取る
  */
+static void ble_advertise(void);
 
-// GATT Server イベントハンドラ
-static void gatts_event_handler(esp_gatts_cb_event_t event,
-                                 esp_gatt_if_t gatts_if,
-                                 esp_ble_gatts_cb_param_t *param)
+static int gap_event_handler(struct ble_gap_event *event, void *arg)
 {
-    switch (event) {
-        case ESP_GATTS_CONNECT_EVT:
-            ESP_LOGI(TAG, "Master connected!");
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            ESP_LOGI(TAG, "Master connected");
             break;
-
-        case ESP_GATTS_READ_EVT:
-            // 親機がセンサーデータをRead
-            ESP_LOGI(TAG, "Master reading sensor data");
-            // TODO: esp_ble_gatts_send_response() でセンサーデータを返す
-            break;
-
-        case ESP_GATTS_WRITE_EVT:
-            // 親機が制御パラメータをWrite
-            if (param->write.len == sizeof(control_params_t)) {
-                memcpy(&my_params, param->write.value,
-                       sizeof(control_params_t));
-                ESP_LOGI(TAG, "Received params: pump=%dms, threshold=%.1f",
-                         my_params.pump_on_time_ms,
-                         my_params.water_threshold);
-
-                // 設定更新フラグがあればNVSに保存
-                if (my_params.flags & FLAG_UPDATE_CONFIG) {
-                    char key[16];
-                    snprintf(key, sizeof(key), "pump_t");
-                    config_store_set_u16(key, my_params.pump_on_time_ms);
-                    snprintf(key, sizeof(key), "wtr_th");
-                    config_store_set_float(key, my_params.water_threshold);
-                    snprintf(key, sizeof(key), "sleep");
-                    config_store_set_u16(key, my_params.sleep_duration_min);
-                    ESP_LOGI(TAG, "Config saved to NVS");
-                }
-            }
-            ble_data_exchanged = true;
-            break;
-
-        case ESP_GATTS_DISCONNECT_EVT:
+        case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "Master disconnected");
-            ble_data_exchanged = true;  // 切断されたら完了扱い
+            ble_data_exchanged = true;
+            ble_advertise();
             break;
-
         default:
             break;
     }
+    return 0;
 }
 
-// GAP イベントハンドラ (アドバタイズ関連)
-static void gap_event_handler(esp_gap_ble_cb_event_t event,
-                               esp_ble_gap_cb_param_t *param)
+static void ble_advertise(void)
 {
-    switch (event) {
-        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            if (param->adv_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-                ESP_LOGI(TAG, "BLE advertising started");
-            }
-            break;
-        default:
-            break;
-    }
+    struct ble_gap_adv_params adv_params = {0};
+    struct ble_hs_adv_fields fields = {0};
+    char device_name[16];
+
+    snprintf(device_name, sizeof(device_name), "%s%02d",
+             SLAVE_NAME_PREFIX, MY_SLAVE_ID);
+
+    fields.name = (uint8_t *)device_name;
+    fields.name_len = strlen(device_name);
+    fields.name_is_complete = 1;
+    ble_gap_adv_set_fields(&fields);
+
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
+                      &adv_params, gap_event_handler, NULL);
+
+    ESP_LOGI(TAG, "BLE advertising as '%s'", device_name);
 }
+
+static void nimble_host_task(void *param)
+{
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
 
 /**
  * BLE初期化＆アドバタイズ開始
  */
 static void ble_init_and_advertise(void)
 {
-    // BLEコントローラ初期化
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
-
-    // Bluedroidスタック
-    ESP_ERROR_CHECK(esp_bluedroid_init());
-    ESP_ERROR_CHECK(esp_bluedroid_enable());
-
-    // コールバック登録
-    ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
-    ESP_ERROR_CHECK(esp_ble_gatts_register_callback(gatts_event_handler));
-
-    // デバイス名設定 (例: "PLANT_01")
-    char device_name[16];
-    snprintf(device_name, sizeof(device_name), "%s%02d",
-             SLAVE_NAME_PREFIX, MY_SLAVE_ID);
-    esp_ble_gap_set_device_name(device_name);
-
-    // アドバタイズ設定
-    esp_ble_adv_params_t adv_params = {
-        .adv_int_min    = 0x20,
-        .adv_int_max    = 0x40,
-        .adv_type       = ADV_TYPE_IND,
-        .own_addr_type  = BLE_ADDR_TYPE_PUBLIC,
-        .channel_map    = ADV_CHNL_ALL,
-        .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-    };
-
-    // TODO: サービスUUIDをアドバタイズデータに含める
-    // TODO: GATTサービス・キャラクタリスティックの登録
-
-    esp_ble_gap_start_advertising(&adv_params);
-    ESP_LOGI(TAG, "BLE advertising as '%s'", device_name);
+    nimble_port_init();
+    ble_svc_gap_init();
+    ble_hs_cfg.sync_cb = ble_advertise;
+    nimble_port_freertos_init(nimble_host_task);
+    ESP_LOGI(TAG, "NimBLE initialized");
 }
 
-/**
- * BLE停止 (ディープスリープ前にメモリ解放)
- */
 static void ble_deinit(void)
 {
-    esp_bluedroid_disable();
-    esp_bluedroid_deinit();
-    esp_bt_controller_disable();
-    esp_bt_controller_deinit();
+    nimble_port_stop();
+    nimble_port_deinit();
     ESP_LOGI(TAG, "BLE deinitialized");
 }
-
 /* ============================================================
  * メンテナンスモード
  * ============================================================
@@ -413,6 +362,7 @@ static void load_params(void)
  * この「起動→処理→スリープ」のパターンは
  * Arduinoで ESP.deepSleep() を使う時と基本的に同じ。
  */
+#include "esp_task_wdt.h"
 void app_main(void)
 {
     boot_count++;
@@ -425,14 +375,18 @@ void app_main(void)
 
     // --- 1. 基本初期化 ---
     config_store_init();
+    ESP_LOGI(TAG, ">>> config_store OK");
     gpio_init();
+    ESP_LOGI(TAG, ">>> gpio_init OK");
     load_params();
+    ESP_LOGI(TAG, ">>> load_params OK");
 
     // --- 2. メンテナンスモード判定 ---
     // モードスイッチがLOW(ON) → メンテナンスモード
     if (gpio_get_level(GPIO_MODE_SWITCH) == 0) {
         // メンテナンスモード用BLE初期化
         // TODO: MAINT_SERVICE_UUID でアドバタイズ
+        esp_task_wdt_deinit();
         ble_init_and_advertise();
         maintenance_mode();
         // ↑ ここからは戻ってこない (リブートで抜ける)
@@ -445,7 +399,9 @@ void app_main(void)
     check_and_water(&my_sensor_data);
 
     // --- 5. BLE通信 (親機にデータ送信) ---
+    esp_task_wdt_deinit();
     ble_init_and_advertise();
+    ESP_LOGI(TAG, "Waiting for BLE connection...");
 
     // 親機が接続してくるのを待つ (タイムアウト付き)
     int wait_count = 0;
