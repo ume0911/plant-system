@@ -12,7 +12,7 @@
  *   6. 切断 → ディープスリープへ
  *
  * 動作フロー (メンテナンスモード):
- *   - モードスイッチがONの場合
+ *   - ディープスリープ中にD2スイッチON → GPIO割り込みで起床
  *   - ディープスリープしない
  *   - スマホからBLE接続可能 (別のサービスUUID)
  *   - パラメータの表示・変更が可能
@@ -23,7 +23,7 @@
  *   - 水タンク: 超音波センサー or フロートスイッチ
  *   - 電圧:   ADC (分圧回路経由)
  *   - ポンプ:  MOSFET経由でGPIO制御
- *   - モードSW: GPIO (プルアップ)
+ *   - モードSW: GPIO7 (プルアップ、GNDに落とすとメンテナンスモード)
  */
 
 #include <stdio.h>
@@ -49,7 +49,6 @@
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
 
-
 /* 共通ライブラリ */
 #include "ble_protocol.h"
 #include "config_store.h"
@@ -61,7 +60,7 @@ static const char *TAG = "slave";
 
 // --- GPIO ピン定義 (実際の配線に合わせて変更) ---
 #define GPIO_PUMP           GPIO_NUM_6      // D4
-#define GPIO_MODE_SWITCH    GPIO_NUM_7      // D5
+#define GPIO_MODE_SWITCH    GPIO_NUM_7      // D5 (RTC GPIO対応、ext1で使用)
 #define GPIO_LED_STATUS     GPIO_NUM_15     // オンボードLED
 
 // --- I2C設定 (センサー用) ---
@@ -95,11 +94,7 @@ static volatile bool ble_data_exchanged = false;
 
 /* ============================================================
  * センサー読み取り
- * ============================================================
- *
- * TODO: 実際のセンサードライバに置き換える
- * ここではダミー値を返す
- */
+ * ============================================================ */
 static void read_sensors(sensor_data_t *data)
 {
     data->slave_id = MY_SLAVE_ID;
@@ -136,20 +131,17 @@ static void check_and_water(sensor_data_t *data)
 {
     bool should_water = false;
 
-    // 湿度が閾値以下なら水やり
     if (data->humidity < my_params.water_threshold) {
         ESP_LOGI(TAG, "Humidity %.1f < threshold %.1f -> WATERING",
                  data->humidity, my_params.water_threshold);
         should_water = true;
     }
 
-    // 親機から強制水やり指示
     if (my_params.flags & FLAG_FORCE_WATER) {
         ESP_LOGI(TAG, "Force water flag set -> WATERING");
         should_water = true;
     }
 
-    // 水タンクが空なら水やりしない
     if (data->water_tank_level < 5.0f) {
         ESP_LOGW(TAG, "Water tank nearly empty, skipping water");
         should_water = false;
@@ -157,26 +149,17 @@ static void check_and_water(sensor_data_t *data)
 
     if (should_water && my_params.pump_on_time_ms > 0) {
         ESP_LOGI(TAG, "Pump ON for %d ms", my_params.pump_on_time_ms);
-
-        gpio_set_level(GPIO_PUMP, 1);                       // ポンプON
-        vTaskDelay(pdMS_TO_TICKS(my_params.pump_on_time_ms)); // 指定時間待つ
-        gpio_set_level(GPIO_PUMP, 0);                       // ポンプOFF
-
+        gpio_set_level(GPIO_PUMP, 1);
+        vTaskDelay(pdMS_TO_TICKS(my_params.pump_on_time_ms));
+        gpio_set_level(GPIO_PUMP, 0);
         data->pump_on_duration_ms = my_params.pump_on_time_ms;
         ESP_LOGI(TAG, "Pump OFF");
     }
 }
 
 /* ============================================================
- * BLE Peripheral (GATT Server)
- * ============================================================
- *
- * 子機は GATT Server として動作:
- *   - PLANT_SERVICE_UUID でアドバタイズ
- *   - 親機が接続してきたら:
- *     - CHAR_SENSOR_DATA: 親機がReadする → センサーデータを返す
- *     - CHAR_CONTROL_PARAMS: 親機がWriteする → 制御パラメータを受け取る
- */
+ * BLE
+ * ============================================================ */
 static void ble_advertise(void);
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg)
@@ -224,10 +207,6 @@ static void nimble_host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
-
-/**
- * BLE初期化＆アドバタイズ開始
- */
 static void ble_init_and_advertise(void)
 {
     nimble_port_init();
@@ -243,31 +222,23 @@ static void ble_deinit(void)
     nimble_port_deinit();
     ESP_LOGI(TAG, "BLE deinitialized");
 }
+
 /* ============================================================
  * メンテナンスモード
- * ============================================================
- *
- * モードスイッチON時:
- *   - ディープスリープしない
- *   - 別のBLEサービス (MAINT_SERVICE_UUID) を公開
- *   - スマホアプリ (nRF Connect等) から接続して:
- *     - 現在のセンサー値を読める
- *     - パラメータを変更できる
- *     - 子機IDを変更できる
- */
+ * ============================================================ */
 static void maintenance_mode(void)
 {
     ESP_LOGW(TAG, "=== MAINTENANCE MODE ===");
     ESP_LOGW(TAG, "Connect via BLE to configure this device");
 
-    // ステータスLED点滅で視覚的にメンテモードを表示
+    // ステータスLED点滅でメンテモードを視覚的に表示
     while (1) {
         gpio_set_level(GPIO_LED_STATUS, 1);
         vTaskDelay(pdMS_TO_TICKS(200));
         gpio_set_level(GPIO_LED_STATUS, 0);
         vTaskDelay(pdMS_TO_TICKS(200));
 
-        // モードスイッチがOFFになったらリブート
+        // スイッチOFFになったらリブート → 通常モードで再起動
         if (gpio_get_level(GPIO_MODE_SWITCH) == 1) {  // プルアップ=OFF
             ESP_LOGI(TAG, "Mode switch OFF, rebooting...");
             esp_restart();
@@ -276,32 +247,40 @@ static void maintenance_mode(void)
 }
 
 /* ============================================================
- * ディープスリープ
+ * ディープスリープ  ★変更箇所1★
  * ============================================================
  *
- * Arduino: ESP.deepSleep(us) に相当
- * ESP-IDFではウェイクアップソースを細かく設定できる
+ * 起床ソース:
+ *   A) タイマー  : 通常の定期起床 (10分)
+ *   B) ext1 GPIO : GPIO_MODE_SWITCH(GPIO7) がLOW → メンテナンスモード
+ *
+ * ESP32C6はext0非対応のため ext1 を使用。
+ * GPIO7はRTC GPIO(0-7)なのでディープスリープ中も監視可能。
  */
 static void enter_deep_sleep(void)
 {
     uint16_t sleep_min = my_params.sleep_duration_min;
     if (sleep_min == 0) sleep_min = DEFAULT_DEEP_SLEEP_MIN;
 
-    uint64_t sleep_us = (uint64_t)sleep_min * 60 * 1000000ULL;
+//    uint64_t sleep_us = (uint64_t)sleep_min * 60 * 1000000ULL;
 
-    ESP_LOGI(TAG, "Entering deep sleep for %d minutes...", sleep_min);
+//    ESP_LOGI(TAG, "Entering deep sleep for %d minutes...", sleep_min);
+    // テスト用：30秒固定
+    uint64_t sleep_us = 30ULL * 1000000ULL;
 
-    // ディープスリープ中もGPIOの状態を保持したい場合:
-    // gpio_hold_en(GPIO_PUMP);  // ポンプOFF状態を保持
+    ESP_LOGI(TAG, "Entering deep sleep for 30 seconds...");
 
-    // タイマーウェイクアップ設定
+
+    // タイマーウェイクアップ (通常起床)
     esp_sleep_enable_timer_wakeup(sleep_us);
 
-    // モードスイッチでもウェイクアップ可能にする (オプション)
-    // esp_sleep_enable_ext0_wakeup(GPIO_MODE_SWITCH, 0);  // LOWでウェイク
+    // ext1ウェイクアップ: GPIO7がLOW → メンテナンスモード起床
+    // プルアップ構成のため、スイッチ押下でLOWになる
+    uint64_t gpio_mask = (1ULL << GPIO_MODE_SWITCH);
+    esp_sleep_enable_ext1_wakeup(gpio_mask, ESP_EXT1_WAKEUP_ANY_LOW);
 
-    // スリープ開始 (ここから先は実行されない)
     esp_deep_sleep_start();
+    // ↑ ここから先は実行されない
 }
 
 /* ============================================================
@@ -309,7 +288,7 @@ static void enter_deep_sleep(void)
  * ============================================================ */
 static void gpio_init(void)
 {
-    // ポンプ制御 (出力)
+    // ポンプ・LED (出力)
     gpio_config_t io_conf_out = {
         .pin_bit_mask = (1ULL << GPIO_PUMP) | (1ULL << GPIO_LED_STATUS),
         .mode         = GPIO_MODE_OUTPUT,
@@ -317,10 +296,10 @@ static void gpio_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
     };
     gpio_config(&io_conf_out);
-    gpio_set_level(GPIO_PUMP, 0);       // 初期状態OFF
+    gpio_set_level(GPIO_PUMP, 0);
     gpio_set_level(GPIO_LED_STATUS, 0);
 
-    // モードスイッチ (入力, プルアップ)
+    // モードスイッチ (入力、内蔵プルアップ)
     gpio_config_t io_conf_in = {
         .pin_bit_mask = (1ULL << GPIO_MODE_SWITCH),
         .mode         = GPIO_MODE_INPUT,
@@ -331,7 +310,7 @@ static void gpio_init(void)
 }
 
 /* ============================================================
- * 制御パラメータのデフォルト値読み出し
+ * 制御パラメータ読み出し
  * ============================================================ */
 static void load_params(void)
 {
@@ -341,7 +320,6 @@ static void load_params(void)
     my_params.sleep_duration_min = DEFAULT_DEEP_SLEEP_MIN;
     my_params.flags              = 0;
 
-    // NVSから保存済みの値を読み出す (なければデフォルト値のまま)
     config_store_get_u16("pump_t",  &my_params.pump_on_time_ms);
     config_store_get_float("wtr_th", &my_params.water_threshold);
     config_store_get_u16("sleep",   &my_params.sleep_duration_min);
@@ -353,19 +331,14 @@ static void load_params(void)
 }
 
 /* ============================================================
- * app_main() - エントリーポイント
- * ============================================================
- *
- * 子機はタスクを作らず、app_main()の中で順番に処理する。
- * (ディープスリープするので、起きたら最初からやり直し)
- *
- * この「起動→処理→スリープ」のパターンは
- * Arduinoで ESP.deepSleep() を使う時と基本的に同じ。
- */
+ * app_main()  ★変更箇所2★
+ * ============================================================ */
 #include "esp_task_wdt.h"
 void app_main(void)
 {
     boot_count++;
+    // シリアルモニタ再接続待ち (起床直後のログを取りこぼさないため)
+    vTaskDelay(pdMS_TO_TICKS(2000));  // ← 追加
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, " Plant Management System - Slave #%d", MY_SLAVE_ID);
@@ -381,15 +354,27 @@ void app_main(void)
     load_params();
     ESP_LOGI(TAG, ">>> load_params OK");
 
-    // --- 2. メンテナンスモード判定 ---
-    // モードスイッチがLOW(ON) → メンテナンスモード
-    if (gpio_get_level(GPIO_MODE_SWITCH) == 0) {
-        // メンテナンスモード用BLE初期化
-        // TODO: MAINT_SERVICE_UUID でアドバタイズ
+    // --- 2. 起床原因判定 ---
+    esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+    ESP_LOGI(TAG, "Wakeup cause: %d", wakeup_cause);
+
+    if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT1) {
+        // GPIO7割り込みで起床 → メンテナンスモード
+        ESP_LOGW(TAG, "Wakeup by maintenance switch (GPIO%d)", GPIO_MODE_SWITCH);
         esp_task_wdt_deinit();
         ble_init_and_advertise();
         maintenance_mode();
-        // ↑ ここからは戻ってこない (リブートで抜ける)
+        // ↑ ここからは戻ってこない (スイッチOFFでリブート)
+    }
+
+    // 通常モード (タイマー起床 or 初回起動)
+    // 安全弁: スイッチが押されたままの状態でも対応
+    if (gpio_get_level(GPIO_MODE_SWITCH) == 0) {
+        ESP_LOGW(TAG, "Mode switch ON at boot (fallback)");
+        esp_task_wdt_deinit();
+        ble_init_and_advertise();
+        maintenance_mode();
+        // ↑ ここからは戻ってこない
     }
 
     // --- 3. 通常モード: センサー読み取り ---
@@ -403,7 +388,6 @@ void app_main(void)
     ble_init_and_advertise();
     ESP_LOGI(TAG, "Waiting for BLE connection...");
 
-    // 親機が接続してくるのを待つ (タイムアウト付き)
     int wait_count = 0;
     while (!ble_data_exchanged && wait_count < BLE_ADV_TIMEOUT_SEC * 10) {
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -419,7 +403,6 @@ void app_main(void)
     // --- 6. BLE停止 & ディープスリープ ---
     ble_deinit();
 
-    // 強制ウェイクフラグが立っていたらスリープしない
     if (my_params.flags & FLAG_FORCE_WAKE) {
         ESP_LOGW(TAG, "Force wake flag set, not sleeping");
         esp_restart();
