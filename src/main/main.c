@@ -48,6 +48,8 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "host/ble_gatt.h"
 
 /* 共通ライブラリ */
 #include "ble_protocol.h"
@@ -91,6 +93,10 @@ static RTC_DATA_ATTR uint32_t boot_count = 0;
 
 // 親機との通信完了フラグ
 static volatile bool ble_data_exchanged = false;
+static volatile bool ble_connected = false;
+static void load_params(void);
+
+
 
 /* ============================================================
  * センサー読み取り
@@ -165,16 +171,16 @@ static void ble_advertise(void);
 static int gap_event_handler(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
-        case BLE_GAP_EVENT_CONNECT:
-            ESP_LOGI(TAG, "Master connected");
-            break;
+	case BLE_GAP_EVENT_CONNECT:
+    	   ESP_LOGI(TAG, "Master connected");
+           ble_connected = true;   // ← 追加
+        break;
         case BLE_GAP_EVENT_DISCONNECT:
-            ESP_LOGI(TAG, "Master disconnected");
-            ble_data_exchanged = true;
-            ble_advertise();
-            break;
-        default:
-            break;
+           ESP_LOGI(TAG, "Master disconnected");
+           ble_connected = false;  // ← 追加
+           ble_data_exchanged = true;
+           ble_advertise();
+        break;
     }
     return 0;
 }
@@ -211,6 +217,7 @@ static void ble_init_and_advertise(void)
 {
     nimble_port_init();
     ble_svc_gap_init();
+    ble_svc_gatt_init();   // ← GATTサービス基盤を追加
     ble_hs_cfg.sync_cb = ble_advertise;
     nimble_port_freertos_init(nimble_host_task);
     ESP_LOGI(TAG, "NimBLE initialized");
@@ -223,28 +230,190 @@ static void ble_deinit(void)
     ESP_LOGI(TAG, "BLE deinitialized");
 }
 
+
+/* ============================================================
+ * GATT メンテナンスサービス実装
+ * ============================================================ */
+
+// コマンド定義
+#define CMD_PUMP_ON         0x01
+#define CMD_PUMP_OFF        0x02
+#define CMD_SET_PARAMS      0x03
+#define CMD_RESET           0x04
+
+// 接続ハンドル
+static uint16_t maint_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t maint_read_val_handle = 0;
+
+// センサーデータをバイト列に変換して返す
+static int gatt_maint_read_cb(uint16_t conn_handle, uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    // 最新センサーデータを読み取り
+    read_sensors(&my_sensor_data);
+
+    int rc = os_mbuf_append(ctxt->om,
+                            &my_sensor_data,
+                            sizeof(sensor_data_t));
+    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+// スマホからの書き込み処理
+static int gatt_maint_write_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    uint8_t cmd = 0;
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+
+    if (len < 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+
+    os_mbuf_copydata(ctxt->om, 0, 1, &cmd);
+    ESP_LOGI(TAG, "GATT Write: cmd=0x%02X len=%d", cmd, len);
+
+    switch (cmd) {
+        case CMD_PUMP_ON: {
+            uint16_t on_ms = my_params.pump_on_time_ms;
+            if (len >= 3) {
+                os_mbuf_copydata(ctxt->om, 1, 2, &on_ms);
+            }
+            ESP_LOGI(TAG, "Pump ON for %d ms", on_ms);
+            gpio_set_level(GPIO_PUMP, 1);
+            vTaskDelay(pdMS_TO_TICKS(on_ms));
+            gpio_set_level(GPIO_PUMP, 0);
+            ESP_LOGI(TAG, "Pump OFF");
+            break;
+        }
+        case CMD_PUMP_OFF:
+            gpio_set_level(GPIO_PUMP, 0);
+            ESP_LOGI(TAG, "Pump forced OFF");
+            break;
+
+        case CMD_SET_PARAMS: {
+            if (len < 1 + sizeof(control_params_t)) {
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            control_params_t new_params;
+            os_mbuf_copydata(ctxt->om, 1, sizeof(control_params_t), &new_params);
+            // NVSに保存
+            config_store_set_u16("pump_t",  new_params.pump_on_time_ms);
+            config_store_set_float("wtr_th", new_params.water_threshold);
+            config_store_set_u16("sleep",   new_params.sleep_duration_min);
+            my_params = new_params;
+            ESP_LOGI(TAG, "Params updated: pump=%dms threshold=%.1f sleep=%dmin",
+                     my_params.pump_on_time_ms,
+                     my_params.water_threshold,
+                     my_params.sleep_duration_min);
+            break;
+        }
+        case CMD_RESET:
+            ESP_LOGI(TAG, "Reset command received");
+            esp_restart();
+            break;
+
+        default:
+            ESP_LOGW(TAG, "Unknown command: 0x%02X", cmd);
+            break;
+    }
+    return 0;
+}
+
+// UUID定義（staticで永続化）
+static ble_uuid128_t svc_uuid = {
+    .u = { .type = BLE_UUID_TYPE_128 },
+    .value = { 0xde, 0xf9, 0x89, 0x56, 0x34, 0x12,
+               0x34, 0x12, 0x34, 0x12, 0x34, 0x12,
+               0x78, 0x56, 0x34, 0x12 }
+};
+static ble_uuid128_t chr_read_uuid = {
+    .u = { .type = BLE_UUID_TYPE_128 },
+    .value = { 0xe1, 0xde, 0x89, 0x56, 0x34, 0x12,
+               0x34, 0x12, 0x34, 0x12, 0x34, 0x12,
+               0x78, 0x56, 0x34, 0x12 }
+};
+static ble_uuid128_t chr_write_uuid = {
+    .u = { .type = BLE_UUID_TYPE_128 },
+    .value = { 0xe2, 0xde, 0x89, 0x56, 0x34, 0x12,
+               0x34, 0x12, 0x34, 0x12, 0x34, 0x12,
+               0x78, 0x56, 0x34, 0x12 }
+};
+
+// Characteristics配列（staticで独立定義）
+static const struct ble_gatt_chr_def gatt_maint_chrs[] = {
+    {
+        .uuid = &chr_read_uuid.u,
+        .access_cb = gatt_maint_read_cb,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &maint_read_val_handle,
+    },
+    {
+        .uuid = &chr_write_uuid.u,
+        .access_cb = gatt_maint_write_cb,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    { 0 }
+};
+
+static const struct ble_gatt_svc_def gatt_maint_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &svc_uuid.u,
+        .characteristics = gatt_maint_chrs,
+    },
+    { 0 }
+};
+
+// GATTサービス初期化
+static void gatt_maint_init(void)
+{
+    int rc = ble_gatts_count_cfg(gatt_maint_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_count_cfg failed: %d", rc);
+        return;
+    }
+    rc = ble_gatts_add_svcs(gatt_maint_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_add_svcs failed: %d", rc);
+        return;
+    }
+    ESP_LOGI(TAG, "GATT maintenance service registered");
+}
+
 /* ============================================================
  * メンテナンスモード
  * ============================================================ */
 static void maintenance_mode(void)
 {
     ESP_LOGW(TAG, "=== MAINTENANCE MODE ===");
-    ESP_LOGW(TAG, "Connect via BLE to configure this device");
 
-    // ステータスLED点滅でメンテモードを視覚的に表示
+    // パラメータ読み込み
+    load_params();
+    int idle_count = 0;  // 未接続カウンター
+    // GATTサービス登録
+//    gatt_maint_init();
+
+    ESP_LOGW(TAG, "Connect via BLE (PLANT_0%d) to configure", MY_SLAVE_ID);
+
+    // LEDチカチカしながらスイッチOFF待ち
     while (1) {
         gpio_set_level(GPIO_LED_STATUS, 1);
         vTaskDelay(pdMS_TO_TICKS(200));
         gpio_set_level(GPIO_LED_STATUS, 0);
         vTaskDelay(pdMS_TO_TICKS(200));
 
-        // スイッチOFFになったらリブート → 通常モードで再起動
-        if (gpio_get_level(GPIO_MODE_SWITCH) == 1) {  // プルアップ=OFF
-            ESP_LOGI(TAG, "Mode switch OFF, rebooting...");
-            esp_restart();
+        if (ble_connected) {
+            idle_count = 0;  // 接続中はリセット
+        } else {
+            idle_count++;
+            // 30秒（400ms×75回）経過後にスイッチOFFでリブート
+            if (idle_count > 75 && gpio_get_level(GPIO_MODE_SWITCH) == 1) {
+                ESP_LOGI(TAG, "Mode switch OFF, rebooting...");
+                gpio_set_level(GPIO_PUMP, 0);
+                esp_restart();
+            }
         }
     }
 }
+
 
 /* ============================================================
  * ディープスリープ  ★変更箇所1★
@@ -259,6 +428,8 @@ static void maintenance_mode(void)
  */
 static void enter_deep_sleep(void)
 {
+//    esp_sleep_config_gpio_isolate();  // ← この行を追加
+    gpio_sleep_sel_dis(GPIO_MODE_SWITCH);  // ← この行を追加
     uint16_t sleep_min = my_params.sleep_duration_min;
     if (sleep_min == 0) sleep_min = DEFAULT_DEEP_SLEEP_MIN;
 
@@ -278,7 +449,7 @@ static void enter_deep_sleep(void)
     // プルアップ構成のため、スイッチ押下でLOWになる
     uint64_t gpio_mask = (1ULL << GPIO_MODE_SWITCH);
     esp_sleep_enable_ext1_wakeup(gpio_mask, ESP_EXT1_WAKEUP_ANY_LOW);
-
+//    gpio_hold_en(GPIO_MODE_SWITCH);
     esp_deep_sleep_start();
     // ↑ ここから先は実行されない
 }
@@ -338,7 +509,7 @@ void app_main(void)
 {
     boot_count++;
     // シリアルモニタ再接続待ち (起床直後のログを取りこぼさないため)
-    vTaskDelay(pdMS_TO_TICKS(2000));  // ← 追加
+    vTaskDelay(pdMS_TO_TICKS(3000));  // ← 追加
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, " Plant Management System - Slave #%d", MY_SLAVE_ID);
@@ -351,21 +522,22 @@ void app_main(void)
     ESP_LOGI(TAG, ">>> config_store OK");
     gpio_init();
     ESP_LOGI(TAG, ">>> gpio_init OK");
-    load_params();
-    ESP_LOGI(TAG, ">>> load_params OK");
-
+    vTaskDelay(pdMS_TO_TICKS(50));  // GPIO安定待ち（50msで十分）
+    ESP_LOGI(TAG, ">>> GPIO7 level: %d", gpio_get_level(GPIO_MODE_SWITCH));  // ← 追加
     // --- 2. 起床原因判定 ---
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "Wakeup cause: %d", wakeup_cause);
 
+//    if (gpio_get_level(GPIO_MODE_SWITCH) == 0) {
     if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT1) {
-        // GPIO7割り込みで起床 → メンテナンスモード
-        ESP_LOGW(TAG, "Wakeup by maintenance switch (GPIO%d)", GPIO_MODE_SWITCH);
-        esp_task_wdt_deinit();
-        ble_init_and_advertise();
-        maintenance_mode();
-        // ↑ ここからは戻ってこない (スイッチOFFでリブート)
+       ESP_LOGW(TAG, "Wakeup by maintenance switch (GPIO%d)", GPIO_MODE_SWITCH);
+       esp_task_wdt_deinit();
+//       gatt_maint_init();         // 1. GATTサービス登録
+       ble_init_and_advertise();  // 2. NimBLE起動
+       maintenance_mode();
     }
+    load_params();
+    ESP_LOGI(TAG, ">>> load_params OK");
 
     // 通常モード (タイマー起床 or 初回起動)
     // 安全弁: スイッチが押されたままの状態でも対応
@@ -407,7 +579,7 @@ void app_main(void)
         ESP_LOGW(TAG, "Force wake flag set, not sleeping");
         esp_restart();
     }
-
+    ESP_LOGI(TAG, ">>> GPIO7 level before sleep: %d", gpio_get_level(GPIO_MODE_SWITCH));
     enter_deep_sleep();
     // ↑ ここから先は実行されない
 }
