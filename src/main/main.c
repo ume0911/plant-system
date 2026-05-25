@@ -212,12 +212,27 @@ static void nimble_host_task(void *param)
     nimble_port_run();
     nimble_port_freertos_deinit();
 }
+// 前方宣言
+static const struct ble_gatt_svc_def gatt_maint_svcs[];
 
-static void ble_init_and_advertise(void)
+static void ble_init_and_advertise(bool with_gatt)
 {
     nimble_port_init();
     ble_svc_gap_init();
-    ble_svc_gatt_init();   // ← GATTサービス基盤を追加
+    ble_svc_gatt_init();
+
+    if (with_gatt) {
+        int rc = ble_gatts_count_cfg(gatt_maint_svcs);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gatts_count_cfg failed: %d", rc);
+        } else {
+            rc = ble_gatts_add_svcs(gatt_maint_svcs);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "ble_gatts_add_svcs failed: %d", rc);
+            }
+        }
+    }
+
     ble_hs_cfg.sync_cb = ble_advertise;
     nimble_port_freertos_init(nimble_host_task);
     ESP_LOGI(TAG, "NimBLE initialized");
@@ -242,7 +257,8 @@ static void ble_deinit(void)
 #define CMD_RESET           0x04
 
 // 接続ハンドル
-static uint16_t maint_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+//static uint16_t maint_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t maint_conn_handle __attribute__((unused)) = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t maint_read_val_handle = 0;
 
 // センサーデータをバイト列に変換して返す
@@ -363,7 +379,8 @@ static const struct ble_gatt_svc_def gatt_maint_svcs[] = {
 };
 
 // GATTサービス初期化
-static void gatt_maint_init(void)
+static void __attribute__((unused)) gatt_maint_init(void)
+//static void gatt_maint_init(void)
 {
     int rc = ble_gatts_count_cfg(gatt_maint_svcs);
     if (rc != 0) {
@@ -428,30 +445,15 @@ static void maintenance_mode(void)
  */
 static void enter_deep_sleep(void)
 {
-//    esp_sleep_config_gpio_isolate();  // ← この行を追加
-    gpio_sleep_sel_dis(GPIO_MODE_SWITCH);  // ← この行を追加
-    uint16_t sleep_min = my_params.sleep_duration_min;
-    if (sleep_min == 0) sleep_min = DEFAULT_DEEP_SLEEP_MIN;
-
-//    uint64_t sleep_us = (uint64_t)sleep_min * 60 * 1000000ULL;
-
-//    ESP_LOGI(TAG, "Entering deep sleep for %d minutes...", sleep_min);
-    // テスト用：30秒固定
+    gpio_sleep_sel_dis(GPIO_MODE_SWITCH);
     uint64_t sleep_us = 30ULL * 1000000ULL;
-
     ESP_LOGI(TAG, "Entering deep sleep for 30 seconds...");
-
-
-    // タイマーウェイクアップ (通常起床)
     esp_sleep_enable_timer_wakeup(sleep_us);
-
-    // ext1ウェイクアップ: GPIO7がLOW → メンテナンスモード起床
-    // プルアップ構成のため、スイッチ押下でLOWになる
     uint64_t gpio_mask = (1ULL << GPIO_MODE_SWITCH);
     esp_sleep_enable_ext1_wakeup(gpio_mask, ESP_EXT1_WAKEUP_ANY_LOW);
-//    gpio_hold_en(GPIO_MODE_SWITCH);
+    ESP_LOGI(TAG, ">>> calling esp_deep_sleep_start()");
+    vTaskDelay(pdMS_TO_TICKS(100));  // ログ出力を待つ
     esp_deep_sleep_start();
-    // ↑ ここから先は実行されない
 }
 
 /* ============================================================
@@ -533,7 +535,8 @@ void app_main(void)
        ESP_LOGW(TAG, "Wakeup by maintenance switch (GPIO%d)", GPIO_MODE_SWITCH);
        esp_task_wdt_deinit();
 //       gatt_maint_init();         // 1. GATTサービス登録
-       ble_init_and_advertise();  // 2. NimBLE起動
+//       ble_init_and_advertise();  // 2. NimBLE起動
+       ble_init_and_advertise(true);
        maintenance_mode();
     }
     load_params();
@@ -544,7 +547,8 @@ void app_main(void)
     if (gpio_get_level(GPIO_MODE_SWITCH) == 0) {
         ESP_LOGW(TAG, "Mode switch ON at boot (fallback)");
         esp_task_wdt_deinit();
-        ble_init_and_advertise();
+//        ble_init_and_advertise();
+        ble_init_and_advertise(true);
         maintenance_mode();
         // ↑ ここからは戻ってこない
     }
@@ -557,7 +561,8 @@ void app_main(void)
 
     // --- 5. BLE通信 (親機にデータ送信) ---
     esp_task_wdt_deinit();
-    ble_init_and_advertise();
+//    ble_init_and_advertise();
+    ble_init_and_advertise(false);
     ESP_LOGI(TAG, "Waiting for BLE connection...");
 
     int wait_count = 0;
