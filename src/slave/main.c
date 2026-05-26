@@ -1,3 +1,4 @@
+#ifdef DEVICE_ROLE_SLAVE
 /*
  * ============================================================
  * 子機 (Slave) メインプログラム
@@ -588,3 +589,4 @@ void app_main(void)
     enter_deep_sleep();
     // ↑ ここから先は実行されない
 }
+#endif // DEVICE_ROLE_SLAVE
