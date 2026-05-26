@@ -122,6 +122,7 @@ static void nimble_host_task(void *param)
  * ============================================================ */
 void app_main(void)
 {
+    vTaskDelay(pdMS_TO_TICKS(5000));  // 5秒待機（接続待ち）
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, " Plant Management System - Master");
     ESP_LOGI(TAG, "========================================");
