@@ -268,7 +268,7 @@ static int gatt_maint_read_cb(uint16_t conn_handle, uint16_t attr_handle,
 {
     // 最新センサーデータを読み取り
     read_sensors(&my_sensor_data);
-
+    ESP_LOGI(TAG, "Sending sensor_data_t: %d bytes", sizeof(sensor_data_t));
     int rc = os_mbuf_append(ctxt->om,
                             &my_sensor_data,
                             sizeof(sensor_data_t));
@@ -563,7 +563,8 @@ void app_main(void)
     // --- 5. BLE通信 (親機にデータ送信) ---
     esp_task_wdt_deinit();
 //    ble_init_and_advertise();
-    ble_init_and_advertise(false);
+//    ble_init_and_advertise(false);
+    ble_init_and_advertise(true);
     ESP_LOGI(TAG, "Waiting for BLE connection...");
 
     int wait_count = 0;
