@@ -205,6 +205,74 @@ static char g_slave_name[32];
 /* ============================================================
  * 終了処理（デバッグ待機→リセット）
  * ============================================================ */
+
+/* ============================================================
+ * WiFi
+ * ============================================================ */
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "freertos/event_groups.h"
+
+#define WIFI_SSID          "あなたのSSID"
+#define WIFI_PASSWORD      "あなたのパスワード"
+#define WIFI_TIMEOUT_MS    20000
+
+static EventGroupHandle_t g_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupSetBits(g_wifi_event_group, WIFI_FAIL_BIT);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(g_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static bool wifi_connect(void)
+{
+    g_wifi_event_group = xEventGroupCreate();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+    wifi_config_t wifi_cfg = {0};
+    strncpy((char*)wifi_cfg.sta.ssid,     WIFI_SSID,     sizeof(wifi_cfg.sta.ssid)-1);
+    strncpy((char*)wifi_cfg.sta.password, WIFI_PASSWORD, sizeof(wifi_cfg.sta.password)-1);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+    esp_wifi_start();
+    ESP_LOGI(TAG, "WiFi connecting...");
+    EventBits_t bits = xEventGroupWaitBits(g_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(WIFI_TIMEOUT_MS));
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi connected!");
+        return true;
+    } else {
+        ESP_LOGE(TAG, "WiFi failed or timeout");
+        g_stats.wifi_err_count++;
+        stats_save();
+        return false;
+    }
+}
+
+static void wifi_disconnect(void)
+{
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    esp_event_loop_delete_default();
+    vEventGroupDelete(g_wifi_event_group);
+    ESP_LOGI(TAG, "WiFi disconnected");
+}
+
 static void finish_and_restart(const char *reason)
 {
     ESP_LOGI(TAG, "Done: %s", reason);
@@ -446,7 +514,13 @@ static void master_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    /* TODO: WiFi送信 */
+    /* WiFiフェーズ */
+    if (wifi_connect()) {
+        ESP_LOGI(TAG, "WiFi OK");
+        wifi_disconnect();
+    } else {
+        ESP_LOGW(TAG, "WiFi失敗");
+    }
 
     finish_and_restart("success");
 }
