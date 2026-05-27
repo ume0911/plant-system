@@ -24,6 +24,113 @@
 
 /* 共通ライブラリ */
 #include "ble_protocol.h"
+/* SPIFFS */
+#include "esp_spiffs.h"
+#include "cJSON.h"
+
+#define SPIFFS_QUEUE_PATH  "/spiffs/queue.json"
+#define QUEUE_MAX_COUNT    864  /* 各子機144件×6台 */
+
+static void spiffs_init(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE("spiffs", "Failed to mount: %d", ret);
+    } else {
+        ESP_LOGI("spiffs", "Mounted OK");
+    }
+}
+
+/* キューにセンサーデータを追加 */
+static void __attribute__((unused)) queue_push(sensor_data_t *data, bool ble_ok, const char *err_reason)
+{
+    /* 既存のJSONを読む */
+    cJSON *arr = NULL;
+    FILE *f = fopen(SPIFFS_QUEUE_PATH, "r");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char *buf = malloc(sz + 1);
+        if (buf) {
+            fread(buf, 1, sz, f);
+            buf[sz] = 0;
+            arr = cJSON_Parse(buf);
+            free(buf);
+        }
+        fclose(f);
+    }
+    if (!arr || !cJSON_IsArray(arr)) {
+        if (arr) cJSON_Delete(arr);
+        arr = cJSON_CreateArray();
+    }
+
+    /* 最大件数超えたら古いものを削除 */
+    while (cJSON_GetArraySize(arr) >= QUEUE_MAX_COUNT) {
+        cJSON_DeleteItemFromArray(arr, 0);
+    }
+
+    /* 新しいデータを追加 */
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddNumberToObject(item, "slave_id",     data->slave_id);
+    cJSON_AddNumberToObject(item, "temperature",  data->temperature);
+    cJSON_AddNumberToObject(item, "humidity",     data->humidity);
+    cJSON_AddNumberToObject(item, "light",        data->light);
+    cJSON_AddNumberToObject(item, "water_level",  data->water_tank_level);
+    cJSON_AddNumberToObject(item, "battery_volt", data->battery_voltage);
+    cJSON_AddNumberToObject(item, "pump_on_ms",   data->pump_on_duration_ms);
+    cJSON_AddNumberToObject(item, "uptime_count", data->uptime_count);
+    cJSON_AddNumberToObject(item, "ble_success",  ble_ok ? 1 : 0);
+    if (err_reason) cJSON_AddStringToObject(item, "ble_err_reason", err_reason);
+    cJSON_AddItemToArray(arr, item);
+
+    /* 書き戻す */
+    char *out = cJSON_PrintUnformatted(arr);
+    if (out) {
+        FILE *fw = fopen(SPIFFS_QUEUE_PATH, "w");
+        if (fw) { fputs(out, fw); fclose(fw); }
+        free(out);
+    }
+    cJSON_Delete(arr);
+    ESP_LOGI("spiffs", "Queue push done, size=%d", cJSON_GetArraySize(arr));
+}
+
+/* キューを読んでJSON文字列を返す（呼び出し側でfree必要） */
+static char __attribute__((unused)) *queue_read_all(int *count)
+{
+    *count = 0;
+    FILE *f = fopen(SPIFFS_QUEUE_PATH, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    fread(buf, 1, sz, f);
+    buf[sz] = 0;
+    fclose(f);
+    cJSON *arr = cJSON_Parse(buf);
+    if (arr && cJSON_IsArray(arr)) {
+        *count = cJSON_GetArraySize(arr);
+        cJSON_Delete(arr);
+    }
+    return buf;
+}
+
+/* キューをクリア */
+static void __attribute__((unused)) queue_clear(void)
+{
+    FILE *f = fopen(SPIFFS_QUEUE_PATH, "w");
+    if (f) { fputs("[]", f); fclose(f); }
+    ESP_LOGI("spiffs", "Queue cleared");
+}
+
 /* NVS統計 */
 #include "nvs.h"
 
@@ -382,6 +489,9 @@ void app_main(void)
     }
 
     g_sem_read_done = xSemaphoreCreateBinary();
+
+    /* SPIFFS初期化 */
+    spiffs_init();
 
     /* NVS統計ロード */
     stats_load();
