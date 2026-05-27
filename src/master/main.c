@@ -198,9 +198,25 @@ static uint16_t g_sensor_val_handle = 0;
 static SemaphoreHandle_t g_sem_read_done;
 static sensor_data_t g_sensor_data;
 static bool g_scan_done = false;
+/* 複数台対応 */
+#define MAX_SLAVE_COUNT  6
+
+typedef struct {
+    ble_addr_t addr;
+    char name[32];
+} slave_info_t;
+
+static slave_info_t g_slaves[MAX_SLAVE_COUNT];
+static int  g_slave_count = 0;
+
+/* 設定値キャッシュ（HTTP POSTレスポンスから取得） */
+/* インデックス0は未使用、1-6がslave_id対応 */
+static control_params_t __attribute__((unused)) g_configs[MAX_SLAVE_COUNT + 1];
+static bool g_config_changed[MAX_SLAVE_COUNT + 1];
+
 static bool g_slave_found = false;
-static ble_addr_t g_slave_addr;
-static char g_slave_name[32];
+static ble_addr_t __attribute__((unused)) g_slave_addr;
+static char __attribute__((unused)) g_slave_name[32];
 
 /* ============================================================
  * 終了処理（デバッグ待機→リセット）
@@ -533,10 +549,13 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
     ESP_LOGI(TAG, "Found slave: %s addr_type=%d", name, event->disc.addr.type);
 
     /* 発見 → スキャン停止して接続へ */
-    g_slave_found = true;
-    strncpy(g_slave_name, name, 31);
-    g_slave_addr = event->disc.addr;
-    ble_gap_disc_cancel();
+    /* リストに追加（最大MAX_SLAVE_COUNT台） */
+    if (g_slave_count < MAX_SLAVE_COUNT) {
+        g_slaves[g_slave_count].addr = event->disc.addr;
+        strncpy(g_slaves[g_slave_count].name, name, 31);
+        g_slave_count++;
+        ESP_LOGI(TAG, "Slave added: %s (%d/%d)", name, g_slave_count, MAX_SLAVE_COUNT);
+    }
 
     return 0;
 }
@@ -561,18 +580,18 @@ static void master_task(void *arg)
     }
     ESP_LOGI(TAG, "BLE scan started (%dms)", SCAN_DURATION_MS);
 
-    /* スキャン完了 or 発見まで待つ */
-    while (!g_scan_done && !g_slave_found) {
+    /* スキャン完了まで待つ */
+    while (!g_scan_done) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    if (!g_slave_found) {
+    if (g_slave_count == 0) {
         ESP_LOGW(TAG, "No slave found");
         finish_and_restart("no slave found");
     }
+    ESP_LOGI(TAG, "Found %d slaves", g_slave_count);
 
-    /* 接続 */
-    ESP_LOGI(TAG, "Connecting to %s ...", g_slave_name);
+    /* 各子機に順番に接続してデータ取得 */
     struct ble_gap_conn_params conn_params = {0};
     conn_params.scan_itvl           = 0x0010;
     conn_params.scan_window         = 0x0010;
@@ -583,24 +602,51 @@ static void master_task(void *arg)
     conn_params.min_ce_len          = 0;
     conn_params.max_ce_len          = 0;
 
-    rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &g_slave_addr,
-                         CONNECT_TIMEOUT_MS, &conn_params,
-                         gap_event_cb, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc);
-        finish_and_restart("connect failed");
-    }
+    for (int si = 0; si < g_slave_count; si++) {
+        ESP_LOGI(TAG, "Connecting to %s (%d/%d)...", g_slaves[si].name, si+1, g_slave_count);
 
-    /* GATTリード完了を待つ */
-    if (xSemaphoreTake(g_sem_read_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
-        ESP_LOGW(TAG, "GATT read timeout");
-        finish_and_restart("GATT timeout");
-    }
+        /* セマフォリセット */
+        xSemaphoreTake(g_sem_read_done, 0);
+        g_sensor_val_handle = 0;
+        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
-    /* 切断 */
-    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &g_slaves[si].addr,
+                             CONNECT_TIMEOUT_MS, &conn_params,
+                             gap_event_cb, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc);
+            g_stats.ble_err_count++;
+            queue_push(&g_sensor_data, false, "connect_failed");
+            continue;
+        }
+
+        /* GATTリード完了を待つ */
+        if (xSemaphoreTake(g_sem_read_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+            ESP_LOGW(TAG, "GATT read timeout");
+            g_stats.ble_err_count++;
+            if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            continue;
+        }
+
+        /* SPIFFSキューに追加 */
+        queue_push(&g_sensor_data, true, NULL);
+
+        /* 設定変更があればBLE WRITE（DEE2） */
+        uint8_t sid = g_sensor_data.slave_id;
+        if (sid >= 1 && sid <= MAX_SLAVE_COUNT && g_config_changed[sid]) {
+            ESP_LOGI(TAG, "Writing config to slave %d", sid);
+            /* TODO: DEE2へのWRITE実装 */
+            g_config_changed[sid] = false;
+        }
+
+        /* 切断 */
+        if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
     }
 
     /* WiFiフェーズ */
