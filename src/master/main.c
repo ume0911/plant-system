@@ -195,6 +195,7 @@ static const char *TAG = "master";
  * ============================================================ */
 static uint16_t g_conn_handle    = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t g_sensor_val_handle = 0;
+static uint16_t g_cmd_val_handle = 0;  /* DEE2 コマンドWRITE */
 static SemaphoreHandle_t g_sem_read_done;
 static sensor_data_t g_sensor_data;
 static bool g_scan_done = false;
@@ -454,6 +455,12 @@ static int gatt_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
             g_sensor_val_handle = chr->val_handle;
             ESP_LOGI(TAG, "  -> Sensor CHR found!");
         }
+        /* DEE2（コマンドWRITE） */
+        if (chr->uuid.u128.value[0] == 0xe2 &&
+            chr->uuid.u128.value[1] == 0xde) {
+            g_cmd_val_handle = chr->val_handle;
+            ESP_LOGI(TAG, "  -> Command CHR found!");
+        }
     }
     return 0;
 }
@@ -481,6 +488,7 @@ static int gatt_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                  svc->uuid.u128.value[1], svc->uuid.u128.value[0]);
         /* 128bitサービスのみキャラクタリスティック探索 */
         g_sensor_val_handle = 0;
+        g_cmd_val_handle = 0;
         ble_gattc_disc_all_chrs(conn_handle,
                                 svc->start_handle,
                                 svc->end_handle,
@@ -608,6 +616,7 @@ static void master_task(void *arg)
         /* セマフォリセット */
         xSemaphoreTake(g_sem_read_done, 0);
         g_sensor_val_handle = 0;
+        g_cmd_val_handle = 0;
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
         rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &g_slaves[si].addr,
@@ -638,7 +647,22 @@ static void master_task(void *arg)
         uint8_t sid = g_sensor_data.slave_id;
         if (sid >= 1 && sid <= MAX_SLAVE_COUNT && g_config_changed[sid]) {
             ESP_LOGI(TAG, "Writing config to slave %d", sid);
-            /* TODO: DEE2へのWRITE実装 */
+            /* DEE2へBLE WRITE（設定送信） */
+            if (g_cmd_val_handle != 0) {
+                uint8_t cmd_buf[sizeof(control_params_t) + 1];
+                cmd_buf[0] = 0x03;  /* パラメータ変更コマンド */
+                memcpy(&cmd_buf[1], &g_configs[sid], sizeof(control_params_t));
+                struct os_mbuf *om = ble_hs_mbuf_from_flat(cmd_buf, sizeof(cmd_buf));
+                if (om) {
+                    int wrc = ble_gattc_write(g_conn_handle, g_cmd_val_handle, om, NULL, NULL);
+                    if (wrc == 0) {
+                        ESP_LOGI(TAG, "Config written to slave %d", sid);
+                    } else {
+                        ESP_LOGE(TAG, "BLE WRITE failed: %d", wrc);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                }
+            }
             g_config_changed[sid] = false;
         }
 
