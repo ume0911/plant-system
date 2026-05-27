@@ -273,6 +273,95 @@ static void wifi_disconnect(void)
     ESP_LOGI(TAG, "WiFi disconnected");
 }
 
+
+/* ============================================================
+ * HTTP POST
+ * ============================================================ */
+#include "esp_http_client.h"
+
+#define VPS_URL "https://plant.lakeshower.com/plant/api/post_sensor.php"
+#define HTTP_TIMEOUT_MS 10000
+
+static char g_http_response[2048];
+static int  g_http_response_len = 0;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        int copy_len = evt->data_len;
+        if (g_http_response_len + copy_len >= sizeof(g_http_response) - 1) {
+            copy_len = sizeof(g_http_response) - 1 - g_http_response_len;
+        }
+        memcpy(g_http_response + g_http_response_len, evt->data, copy_len);
+        g_http_response_len += copy_len;
+        g_http_response[g_http_response_len] = 0;
+    }
+    return ESP_OK;
+}
+
+static bool http_post_sensors(void)
+{
+    int queue_count = 0;
+    char *queue_json = queue_read_all(&queue_count);
+    if (!queue_json || queue_count == 0) {
+        ESP_LOGI(TAG, "No data in queue");
+        if (queue_json) free(queue_json);
+        return true;
+    }
+    ESP_LOGI(TAG, "Sending %d records...", queue_count);
+
+    /* JSONボディ作成 */
+    cJSON *root = cJSON_CreateObject();
+    cJSON *sensors = cJSON_Parse(queue_json);
+    free(queue_json);
+    cJSON_AddItemToObject(root, "sensors", sensors);
+
+    /* 統計追加 */
+    cJSON *stats = cJSON_CreateObject();
+    cJSON_AddNumberToObject(stats, "restart_count",  g_stats.restart_count);
+    cJSON_AddNumberToObject(stats, "ble_ok_count",   0);
+    cJSON_AddNumberToObject(stats, "ble_err_count",  g_stats.ble_err_count);
+    cJSON_AddNumberToObject(stats, "wifi_err_count", g_stats.wifi_err_count);
+    cJSON_AddNumberToObject(stats, "http_err_count", g_stats.http_err_count);
+    cJSON_AddNumberToObject(stats, "send_count",     queue_count);
+    cJSON_AddNumberToObject(stats, "queue_count",    0);
+    cJSON_AddItemToObject(root, "stats", stats);
+
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    /* HTTP POST */
+    g_http_response_len = 0;
+    esp_http_client_config_t config = {
+        .url            = VPS_URL,
+        .event_handler  = http_event_handler,
+        .timeout_ms     = HTTP_TIMEOUT_MS,
+        .skip_cert_common_name_check = true,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(body);
+
+    if (err == ESP_OK && status == 200) {
+        ESP_LOGI(TAG, "HTTP POST OK status=%d", status);
+        ESP_LOGI(TAG, "Response: %s", g_http_response);
+        queue_clear();
+        return true;
+    } else {
+        ESP_LOGE(TAG, "HTTP POST failed err=%d status=%d", err, status);
+        g_stats.http_err_count++;
+        stats_save();
+        return false;
+    }
+}
+
 static void finish_and_restart(const char *reason)
 {
     ESP_LOGI(TAG, "Done: %s", reason);
@@ -516,7 +605,11 @@ static void master_task(void *arg)
 
     /* WiFiフェーズ */
     if (wifi_connect()) {
-        ESP_LOGI(TAG, "WiFi OK");
+        if (http_post_sensors()) {
+            ESP_LOGI(TAG, "HTTP POST OK");
+        } else {
+            ESP_LOGW(TAG, "HTTP POST failed");
+        }
         wifi_disconnect();
     } else {
         ESP_LOGW(TAG, "WiFi失敗");
