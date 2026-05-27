@@ -24,6 +24,55 @@
 
 /* 共通ライブラリ */
 #include "ble_protocol.h"
+/* NVS統計 */
+#include "nvs.h"
+
+#define NVS_NAMESPACE     "master_stats"
+#define NVS_KEY_RESTART   "restart_cnt"
+#define NVS_KEY_BLE_ERR   "ble_err_cnt"
+#define NVS_KEY_WIFI_ERR  "wifi_err_cnt"
+#define NVS_KEY_HTTP_ERR  "http_err_cnt"
+#define RESTART_COUNT_MAX 65535
+
+typedef struct {
+    uint32_t restart_count;
+    uint32_t ble_err_count;
+    uint32_t wifi_err_count;
+    uint32_t http_err_count;
+} master_stats_t;
+
+static master_stats_t g_stats = {0};
+
+static void stats_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    nvs_get_u32(h, NVS_KEY_RESTART,  &g_stats.restart_count);
+    nvs_get_u32(h, NVS_KEY_BLE_ERR,  &g_stats.ble_err_count);
+    nvs_get_u32(h, NVS_KEY_WIFI_ERR, &g_stats.wifi_err_count);
+    nvs_get_u32(h, NVS_KEY_HTTP_ERR, &g_stats.http_err_count);
+    nvs_close(h);
+}
+
+static void stats_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u32(h, NVS_KEY_RESTART,  g_stats.restart_count);
+    nvs_set_u32(h, NVS_KEY_BLE_ERR,  g_stats.ble_err_count);
+    nvs_set_u32(h, NVS_KEY_WIFI_ERR, g_stats.wifi_err_count);
+    nvs_set_u32(h, NVS_KEY_HTTP_ERR, g_stats.http_err_count);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void stats_increment_restart(void)
+{
+    g_stats.restart_count++;
+    if (g_stats.restart_count >= RESTART_COUNT_MAX) g_stats.restart_count = 0;
+    stats_save();
+}
+
 
 static const char *TAG = "master";
 
@@ -333,6 +382,10 @@ void app_main(void)
     }
 
     g_sem_read_done = xSemaphoreCreateBinary();
+
+    /* NVS統計ロード */
+    stats_load();
+    stats_increment_restart();
 
     nimble_port_init();
     ble_svc_gap_init();
