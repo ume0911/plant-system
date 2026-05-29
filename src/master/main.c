@@ -1,4 +1,4 @@
-#ifdef DEVICE_ROLE_MASTER
+﻿#ifdef DEVICE_ROLE_MASTER
 /* ============================================================
  * Plant Management System - Master
  * Step 3-2: BLE Central - Scan & Connect & GATT Read
@@ -22,14 +22,14 @@
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
 
-/* 共通ライブラリ */
+/* 蜈ｱ騾壹Λ繧､繝悶Λ繝ｪ */
 #include "ble_protocol.h"
 /* SPIFFS */
 #include "esp_spiffs.h"
 #include "cJSON.h"
 
 #define SPIFFS_QUEUE_PATH  "/spiffs/queue.json"
-#define QUEUE_MAX_COUNT    864  /* 各子機144件×6台 */
+#define QUEUE_MAX_COUNT    864  /* 蜷・ｭ先ｩ・44莉ｶﾃ・蜿ｰ */
 
 static void spiffs_init(void)
 {
@@ -47,10 +47,10 @@ static void spiffs_init(void)
     }
 }
 
-/* キューにセンサーデータを追加 */
+/* 繧ｭ繝･繝ｼ縺ｫ繧ｻ繝ｳ繧ｵ繝ｼ繝・・繧ｿ繧定ｿｽ蜉 */
 static void __attribute__((unused)) queue_push(sensor_data_t *data, bool ble_ok, const char *err_reason)
 {
-    /* 既存のJSONを読む */
+    /* 譌｢蟄倥・JSON繧定ｪｭ繧 */
     cJSON *arr = NULL;
     FILE *f = fopen(SPIFFS_QUEUE_PATH, "r");
     if (f) {
@@ -71,12 +71,12 @@ static void __attribute__((unused)) queue_push(sensor_data_t *data, bool ble_ok,
         arr = cJSON_CreateArray();
     }
 
-    /* 最大件数超えたら古いものを削除 */
+    /* 譛螟ｧ莉ｶ謨ｰ雜・∴縺溘ｉ蜿､縺・ｂ縺ｮ繧貞炎髯､ */
     while (cJSON_GetArraySize(arr) >= QUEUE_MAX_COUNT) {
         cJSON_DeleteItemFromArray(arr, 0);
     }
 
-    /* 新しいデータを追加 */
+    /* 譁ｰ縺励＞繝・・繧ｿ繧定ｿｽ蜉 */
     cJSON *item = cJSON_CreateObject();
     cJSON_AddNumberToObject(item, "slave_id",     data->slave_id);
     cJSON_AddNumberToObject(item, "temperature",  data->temperature);
@@ -90,18 +90,19 @@ static void __attribute__((unused)) queue_push(sensor_data_t *data, bool ble_ok,
     if (err_reason) cJSON_AddStringToObject(item, "ble_err_reason", err_reason);
     cJSON_AddItemToArray(arr, item);
 
-    /* 書き戻す */
+    /* 譖ｸ縺肴綾縺・*/
     char *out = cJSON_PrintUnformatted(arr);
     if (out) {
         FILE *fw = fopen(SPIFFS_QUEUE_PATH, "w");
         if (fw) { fputs(out, fw); fclose(fw); }
         free(out);
     }
+    int final_size = cJSON_GetArraySize(arr);
     cJSON_Delete(arr);
-    ESP_LOGI("spiffs", "Queue push done, size=%d", cJSON_GetArraySize(arr));
+    ESP_LOGI("spiffs", "Queue push done, size=%d", final_size);
 }
 
-/* キューを読んでJSON文字列を返す（呼び出し側でfree必要） */
+/* 繧ｭ繝･繝ｼ繧定ｪｭ繧薙〒JSON譁・ｭ怜・繧定ｿ斐☆・亥他縺ｳ蜃ｺ縺怜・縺ｧfree蠢・ｦ・ｼ・*/
 static char __attribute__((unused)) *queue_read_all(int *count)
 {
     *count = 0;
@@ -123,7 +124,7 @@ static char __attribute__((unused)) *queue_read_all(int *count)
     return buf;
 }
 
-/* キューをクリア */
+/* 繧ｭ繝･繝ｼ繧偵け繝ｪ繧｢ */
 static void __attribute__((unused)) queue_clear(void)
 {
     FILE *f = fopen(SPIFFS_QUEUE_PATH, "w");
@@ -131,7 +132,7 @@ static void __attribute__((unused)) queue_clear(void)
     ESP_LOGI("spiffs", "Queue cleared");
 }
 
-/* NVS統計 */
+/* NVS邨ｱ險・*/
 #include "nvs.h"
 
 #define NVS_NAMESPACE     "master_stats"
@@ -184,22 +185,21 @@ static void stats_increment_restart(void)
 static const char *TAG = "master";
 
 /* ============================================================
- * 設定
- * ============================================================ */
+ * 險ｭ螳・ * ============================================================ */
 #define SCAN_DURATION_MS        5000
 #define CONNECT_TIMEOUT_MS      10000
-#define DEBUG_WAIT_MS           10000   /* デバッグ用待機（本番では削除） */
+#define DEBUG_WAIT_MS           10000   /* 繝・ヰ繝・げ逕ｨ蠕・ｩ滂ｼ域悽逡ｪ縺ｧ縺ｯ蜑企勁・・*/
 
 /* ============================================================
- * グローバル変数
+ * 繧ｰ繝ｭ繝ｼ繝舌Ν螟画焚
  * ============================================================ */
 static uint16_t g_conn_handle    = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t g_sensor_val_handle = 0;
-static uint16_t g_cmd_val_handle = 0;  /* DEE2 コマンドWRITE */
+static uint16_t g_cmd_val_handle = 0;  /* DEE2 command WRITE */
 static SemaphoreHandle_t g_sem_read_done;
 static sensor_data_t g_sensor_data;
 static bool g_scan_done = false;
-/* 複数台対応 */
+/* 隍・焚蜿ｰ蟇ｾ蠢・*/
 #define MAX_SLAVE_COUNT  6
 
 typedef struct {
@@ -210,8 +210,8 @@ typedef struct {
 static slave_info_t g_slaves[MAX_SLAVE_COUNT];
 static int  g_slave_count = 0;
 
-/* 設定値キャッシュ（HTTP POSTレスポンスから取得） */
-/* インデックス0は未使用、1-6がslave_id対応 */
+/* 險ｭ螳壼､繧ｭ繝｣繝・す繝･・・TTP POST繝ｬ繧ｹ繝昴Φ繧ｹ縺九ｉ蜿門ｾ暦ｼ・*/
+/* 繧､繝ｳ繝・ャ繧ｯ繧ｹ0縺ｯ譛ｪ菴ｿ逕ｨ縲・-6縺茎lave_id蟇ｾ蠢・*/
 static control_params_t __attribute__((unused)) g_configs[MAX_SLAVE_COUNT + 1];
 static bool g_config_changed[MAX_SLAVE_COUNT + 1];
 
@@ -220,8 +220,7 @@ static ble_addr_t __attribute__((unused)) g_slave_addr;
 static char __attribute__((unused)) g_slave_name[32];
 
 /* ============================================================
- * 終了処理（デバッグ待機→リセット）
- * ============================================================ */
+ * 邨ゆｺ・・逅・ｼ医ョ繝舌ャ繧ｰ蠕・ｩ溪・繝ｪ繧ｻ繝・ヨ・・ * ============================================================ */
 
 /* ============================================================
  * WiFi
@@ -230,8 +229,8 @@ static char __attribute__((unused)) g_slave_name[32];
 #include "esp_event.h"
 #include "freertos/event_groups.h"
 
-#define WIFI_SSID          "あなたのSSID"
-#define WIFI_PASSWORD      "あなたのパスワード"
+#define WIFI_SSID          "Buffalo-G-0150"
+#define WIFI_PASSWORD      "weup7bsx6hw7p"
 #define WIFI_TIMEOUT_MS    20000
 
 static EventGroupHandle_t g_wifi_event_group;
@@ -261,8 +260,11 @@ static bool wifi_connect(void)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
     wifi_config_t wifi_cfg = {0};
-    strncpy((char*)wifi_cfg.sta.ssid,     WIFI_SSID,     sizeof(wifi_cfg.sta.ssid)-1);
-    strncpy((char*)wifi_cfg.sta.password, WIFI_PASSWORD, sizeof(wifi_cfg.sta.password)-1);
+    strncpy((char*)wifi_cfg.sta.ssid,     WIFI_SSID,     sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char*)wifi_cfg.sta.password, WIFI_PASSWORD, sizeof(wifi_cfg.sta.password) - 1);
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_cfg.sta.pmf_cfg.capable  = false;
+    wifi_cfg.sta.pmf_cfg.required = false;
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     esp_wifi_start();
@@ -296,7 +298,7 @@ static void wifi_disconnect(void)
  * ============================================================ */
 #include "esp_http_client.h"
 
-#define VPS_URL "https://plant.lakeshower.com/plant/api/post_sensor.php"
+#define VPS_URL "http://plant.lakeshower.com/plant/api/post_sensor.php"
 #define HTTP_TIMEOUT_MS 10000
 
 static char g_http_response[2048];
@@ -327,13 +329,13 @@ static bool http_post_sensors(void)
     }
     ESP_LOGI(TAG, "Sending %d records...", queue_count);
 
-    /* JSONボディ作成 */
+    /* JSON繝懊ョ繧｣菴懈・ */
     cJSON *root = cJSON_CreateObject();
     cJSON *sensors = cJSON_Parse(queue_json);
     free(queue_json);
     cJSON_AddItemToObject(root, "sensors", sensors);
 
-    /* 統計追加 */
+    /* 邨ｱ險郁ｿｽ蜉 */
     cJSON *stats = cJSON_CreateObject();
     cJSON_AddNumberToObject(stats, "restart_count",  g_stats.restart_count);
     cJSON_AddNumberToObject(stats, "ble_ok_count",   0);
@@ -351,14 +353,16 @@ static bool http_post_sensors(void)
     g_http_response_len = 0;
     esp_http_client_config_t config = {
         .url            = VPS_URL,
+        .host           = "plant.lakeshower.com",
         .event_handler  = http_event_handler,
         .timeout_ms     = HTTP_TIMEOUT_MS,
         .skip_cert_common_name_check = true,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .transport_type = HTTP_TRANSPORT_OVER_TCP,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Host", "plant.lakeshower.com");
     esp_http_client_set_post_field(client, body, strlen(body));
 
     esp_err_t err = esp_http_client_perform(client);
@@ -383,13 +387,13 @@ static void finish_and_restart(const char *reason)
 {
     ESP_LOGI(TAG, "Done: %s", reason);
     ESP_LOGI(TAG, "Waiting %d sec before restart...", DEBUG_WAIT_MS / 1000);
-    vTaskDelay(pdMS_TO_TICKS(DEBUG_WAIT_MS));  /* デバッグ用（本番では削除） */
+    vTaskDelay(pdMS_TO_TICKS(DEBUG_WAIT_MS));  /* 繝・ヰ繝・げ逕ｨ・域悽逡ｪ縺ｧ縺ｯ蜑企勁・・*/
     ESP_LOGI(TAG, "Restarting...");
     esp_restart();
 }
 
 /* ============================================================
- * GATTリードコールバック
+ * GATT繝ｪ繝ｼ繝峨さ繝ｼ繝ｫ繝舌ャ繧ｯ
  * ============================================================ */
 static int gatt_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                         struct ble_gatt_attr *attr, void *arg)
@@ -421,7 +425,7 @@ static int gatt_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error
 }
 
 /* ============================================================
- * キャラクタリスティック探索コールバック
+ * 繧ｭ繝｣繝ｩ繧ｯ繧ｿ繝ｪ繧ｹ繝・ぅ繝・け謗｢邏｢繧ｳ繝ｼ繝ｫ繝舌ャ繧ｯ
  * ============================================================ */
 static int gatt_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                        const struct ble_gatt_chr *chr, void *arg)
@@ -449,13 +453,13 @@ static int gatt_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         ESP_LOGI(TAG, "  CHR UUID128: %02x%02x val_handle=%d",
                  chr->uuid.u128.value[1], chr->uuid.u128.value[0],
                  chr->val_handle);
-        /* DEE1（センサーREAD）*/
+        /* DEE1 sensor READ */
         if (chr->uuid.u128.value[0] == 0xe1 &&
             chr->uuid.u128.value[1] == 0xde) {
             g_sensor_val_handle = chr->val_handle;
             ESP_LOGI(TAG, "  -> Sensor CHR found!");
         }
-        /* DEE2（コマンドWRITE） */
+        /* DEE2 command WRITE */
         if (chr->uuid.u128.value[0] == 0xe2 &&
             chr->uuid.u128.value[1] == 0xde) {
             g_cmd_val_handle = chr->val_handle;
@@ -466,7 +470,7 @@ static int gatt_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 }
 
 /* ============================================================
- * サービス探索コールバック
+ * 繧ｵ繝ｼ繝薙せ謗｢邏｢繧ｳ繝ｼ繝ｫ繝舌ャ繧ｯ
  * ============================================================ */
 static int gatt_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                        const struct ble_gatt_svc *svc, void *arg)
@@ -486,7 +490,7 @@ static int gatt_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     } else if (svc->uuid.u.type == BLE_UUID_TYPE_128) {
         ESP_LOGI(TAG, "Found service UUID128: %02x%02x",
                  svc->uuid.u128.value[1], svc->uuid.u128.value[0]);
-        /* 128bitサービスのみキャラクタリスティック探索 */
+        /* 128bit繧ｵ繝ｼ繝薙せ縺ｮ縺ｿ繧ｭ繝｣繝ｩ繧ｯ繧ｿ繝ｪ繧ｹ繝・ぅ繝・け謗｢邏｢ */
         g_sensor_val_handle = 0;
         g_cmd_val_handle = 0;
         ble_gattc_disc_all_chrs(conn_handle,
@@ -498,7 +502,7 @@ static int gatt_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 }
 
 /* ============================================================
- * GAPイベントコールバック
+ * GAP繧､繝吶Φ繝医さ繝ｼ繝ｫ繝舌ャ繧ｯ
  * ============================================================ */
 static int gap_event_cb(struct ble_gap_event *event, void *arg)
 {
@@ -507,7 +511,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             g_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "Connected! conn_handle=%d", g_conn_handle);
-            ble_gattc_exchange_mtu(g_conn_handle, NULL, NULL);  // 3引数が正しい
+            ble_gattc_exchange_mtu(g_conn_handle, NULL, NULL);  // 3蠑墓焚縺梧ｭ｣縺励＞
             ble_gattc_disc_all_svcs(g_conn_handle, gatt_svc_cb, NULL);
         } else {
             ESP_LOGE(TAG, "Connection failed: %d", event->connect.status);
@@ -528,7 +532,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 }
 
 /* ============================================================
- * BLEスキャンコールバック
+ * BLE繧ｹ繧ｭ繝｣繝ｳ繧ｳ繝ｼ繝ｫ繝舌ャ繧ｯ
  * ============================================================ */
 static int scan_event_cb(struct ble_gap_event *event, void *arg)
 {
@@ -539,7 +543,7 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
     }
 
     if (event->type != BLE_GAP_EVENT_DISC) return 0;
-    if (g_slave_found) return 0;  /* すでに発見済み */
+    if (g_slave_found) return 0;  /* 縺吶〒縺ｫ逋ｺ隕区ｸ医∩ */
 
     struct ble_hs_adv_fields fields;
     if (ble_hs_adv_parse_fields(&fields,
@@ -556,8 +560,8 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
 
     ESP_LOGI(TAG, "Found slave: %s addr_type=%d", name, event->disc.addr.type);
 
-    /* 発見 → スキャン停止して接続へ */
-    /* リストに追加（最大MAX_SLAVE_COUNT台） */
+    /* 逋ｺ隕・竊・繧ｹ繧ｭ繝｣繝ｳ蛛懈ｭ｢縺励※謗･邯壹∈ */
+    /* 繝ｪ繧ｹ繝医↓霑ｽ蜉・域怙螟ｧMAX_SLAVE_COUNT蜿ｰ・・*/
     if (g_slave_count < MAX_SLAVE_COUNT) {
         g_slaves[g_slave_count].addr = event->disc.addr;
         strncpy(g_slaves[g_slave_count].name, name, 31);
@@ -569,11 +573,11 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
 }
 
 /* ============================================================
- * マスタータスク
+ * 繝槭せ繧ｿ繝ｼ繧ｿ繧ｹ繧ｯ
  * ============================================================ */
 static void master_task(void *arg)
 {
-    /* スキャン開始 */
+    /* 繧ｹ繧ｭ繝｣繝ｳ髢句ｧ・*/
     struct ble_gap_disc_params disc_params = {0};
     disc_params.passive           = 0;
     disc_params.itvl              = 0x0010;
@@ -588,7 +592,7 @@ static void master_task(void *arg)
     }
     ESP_LOGI(TAG, "BLE scan started (%dms)", SCAN_DURATION_MS);
 
-    /* スキャン完了まで待つ */
+    /* 繧ｹ繧ｭ繝｣繝ｳ螳御ｺ・∪縺ｧ蠕・▽ */
     while (!g_scan_done) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -599,7 +603,7 @@ static void master_task(void *arg)
     }
     ESP_LOGI(TAG, "Found %d slaves", g_slave_count);
 
-    /* 各子機に順番に接続してデータ取得 */
+    /* 蜷・ｭ先ｩ溘↓鬆・分縺ｫ謗･邯壹＠縺ｦ繝・・繧ｿ蜿門ｾ・*/
     struct ble_gap_conn_params conn_params = {0};
     conn_params.scan_itvl           = 0x0010;
     conn_params.scan_window         = 0x0010;
@@ -613,7 +617,7 @@ static void master_task(void *arg)
     for (int si = 0; si < g_slave_count; si++) {
         ESP_LOGI(TAG, "Connecting to %s (%d/%d)...", g_slaves[si].name, si+1, g_slave_count);
 
-        /* セマフォリセット */
+        /* 繧ｻ繝槭ヵ繧ｩ繝ｪ繧ｻ繝・ヨ */
         xSemaphoreTake(g_sem_read_done, 0);
         g_sensor_val_handle = 0;
         g_cmd_val_handle = 0;
@@ -629,7 +633,7 @@ static void master_task(void *arg)
             continue;
         }
 
-        /* GATTリード完了を待つ */
+        /* GATT繝ｪ繝ｼ繝牙ｮ御ｺ・ｒ蠕・▽ */
         if (xSemaphoreTake(g_sem_read_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
             ESP_LOGW(TAG, "GATT read timeout");
             g_stats.ble_err_count++;
@@ -640,17 +644,17 @@ static void master_task(void *arg)
             continue;
         }
 
-        /* SPIFFSキューに追加 */
+        /* SPIFFS繧ｭ繝･繝ｼ縺ｫ霑ｽ蜉 */
         queue_push(&g_sensor_data, true, NULL);
 
-        /* 設定変更があればBLE WRITE（DEE2） */
+        /* 險ｭ螳壼､画峩縺後≠繧後・BLE WRITE・・EE2・・*/
         uint8_t sid = g_sensor_data.slave_id;
         if (sid >= 1 && sid <= MAX_SLAVE_COUNT && g_config_changed[sid]) {
             ESP_LOGI(TAG, "Writing config to slave %d", sid);
-            /* DEE2へBLE WRITE（設定送信） */
+            /* DEE2 command WRITE */
             if (g_cmd_val_handle != 0) {
                 uint8_t cmd_buf[sizeof(control_params_t) + 1];
-                cmd_buf[0] = 0x03;  /* パラメータ変更コマンド */
+                cmd_buf[0] = 0x03;  /* 繝代Λ繝｡繝ｼ繧ｿ螟画峩繧ｳ繝槭Φ繝・*/
                 memcpy(&cmd_buf[1], &g_configs[sid], sizeof(control_params_t));
                 struct os_mbuf *om = ble_hs_mbuf_from_flat(cmd_buf, sizeof(cmd_buf));
                 if (om) {
@@ -666,14 +670,19 @@ static void master_task(void *arg)
             g_config_changed[sid] = false;
         }
 
-        /* 切断 */
+        /* 蛻・妙 */
         if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             vTaskDelay(pdMS_TO_TICKS(500));
         }
     }
 
-    /* WiFiフェーズ */
+    /* BLE蛛懈ｭ｢縺励※縺九ｉWiFi襍ｷ蜍・*/
+    nimble_port_stop();
+    nimble_port_deinit();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    /* WiFi繝輔ぉ繝ｼ繧ｺ */
     if (wifi_connect()) {
         if (http_post_sensors()) {
             ESP_LOGI(TAG, "HTTP POST OK");
@@ -682,7 +691,7 @@ static void master_task(void *arg)
         }
         wifi_disconnect();
     } else {
-        ESP_LOGW(TAG, "WiFi失敗");
+        ESP_LOGW(TAG, "WiFi failed");
     }
 
     finish_and_restart("success");
@@ -713,7 +722,7 @@ static void nimble_host_task(void *param)
  * ============================================================ */
 void app_main(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(5000));  /* デバッグ用待機（本番では削除） */
+    vTaskDelay(pdMS_TO_TICKS(5000));  /* 繝・ヰ繝・げ逕ｨ蠕・ｩ滂ｼ域悽逡ｪ縺ｧ縺ｯ蜑企勁・・*/
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, " Plant Management System - Master");
     ESP_LOGI(TAG, "========================================");
@@ -727,10 +736,10 @@ void app_main(void)
 
     g_sem_read_done = xSemaphoreCreateBinary();
 
-    /* SPIFFS初期化 */
+    /* SPIFFS蛻晄悄蛹・*/
     spiffs_init();
 
-    /* NVS統計ロード */
+    /* NVS邨ｱ險医Ο繝ｼ繝・*/
     stats_load();
     stats_increment_restart();
 
